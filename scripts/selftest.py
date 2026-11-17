@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """端到端自测：需先启动三服务(默认编排端 http://localhost:8000)。
-覆盖:正常入仓、源站慢(超时/迟到/不重入仓)、等名额、质控慢瓶颈迁移、
-源站首次失败、质控失败阻断、NEG/MIX 钩子、多批交错不串记录。"""
+覆盖:正常入仓、调参交错(慢源调快/重试抢先入仓/即定稿/迟到不改写结论)、
+源站慢(超时/迟到/不重入仓)、等名额、质控慢瓶颈迁移、源站首次失败、
+质控失败阻断、NEG/MIX 钩子、多批交错不串记录。"""
 import json
 import sys
 import time
@@ -71,8 +72,50 @@ def main():
     check("基线结论含关键链", bool(d["conclusion"] and d["conclusion"]["chain"]))
     check("基线无迟到/失败", not spans_of(d, status="late") and not spans_of(d, status="failed"))
 
-    # 2. 源站慢(延迟>超时)：出现超时与迟到尝试，迟到不重复入仓
-    set_config(c, source_delay_ms=2600, client_timeout_ms=900, max_attempts=3)
+    # 2. 调参交错:源站由慢调快,旧取数在途时重试抢先完成质控并入仓。
+    #    批次须即定稿(不等旧请求),完成耗时不含无关等待,关键链含重试等待与有效调用,
+    #    旧请求迟到后只追加时间线证据、不改写结论,列表与详情同一结论。
+    set_config(c, source_delay_ms=3500, source_slots=6, source_fail_first=False,
+               qc_nonneg_delay_ms=150, qc_nonneg_fail_first=False,
+               qc_match_delay_ms=150, qc_match_fail_first=False,
+               client_timeout_ms=700, max_attempts=4)
+    ids = [f"T9-{i}" for i in range(2)]
+    t_start = time.time()
+    bid = submit(c, ids)
+    time.sleep(1.0)  # 旧尝试(慢)在途时,工程师在网页把源站调快
+    set_config(c, source_delay_ms=80)
+    d = wait_batch(c, bid, timeout=60)
+    concl = d["conclusion"]
+    check("调参交错批次完成", d["batch"]["status"] == "done")
+    check("完成耗时不含旧请求迟到等待", concl["wall_s"] < 3.0,
+          f"wall={concl['wall_s']}s(旧尝试约 3.5s 才结束)")
+    check("完成耗时=批次开始至最后入仓",
+          abs(concl["t1"] - max(w["stored_at"] for w in d["warehouse"])) < 1e-6
+          and abs(d["batch"]["finished_at"] - concl["t1"]) < 1e-6)
+    chain = concl["chain"]
+    waits = [g for g in chain["segments"] if g["kind"] == "wait"]
+    check("关键链含重试等待段", any("重试等待" in g["label"] for g in waits),
+          json.dumps([g["label"] for g in chain["segments"]], ensure_ascii=False))
+    eff_seg = [g for g in chain["segments"] if "有效" in g["label"]]
+    check("关键链含有效调用段", len(eff_seg) == 1)
+    check("关键链合计≈完成耗时", abs(chain["total_s"] - concl["wall_s"]) < 0.2,
+          f"chain={chain['total_s']} wall={concl['wall_s']}")
+    row = next(b for b in c.get(f"{BASE}/api/batches", timeout=10).json() if b["id"] == bid)
+    check("列表与详情同一结论", row["status"] == d["batch"]["status"]
+          and abs(row["wall_s"] - concl["wall_s"]) < 1e-6)
+    # 旧请求迟到收尾:时间线追加迟到证据,完成结论不被推迟或改写
+    time.sleep(max(0.0, 3.6 - (time.time() - t_start)) + 1.0)
+    d2 = c.get(f"{BASE}/api/batches/{bid}", timeout=10).json()
+    late = [s for s in d2["spans"] if s["status"] == "late"]
+    check("旧尝试迟到证据已追加到时间线", len(late) >= 2, f"{len(late)} 条")
+    check("迟到不推迟不改写完成结论",
+          d2["conclusion"]["wall_s"] == concl["wall_s"]
+          and d2["batch"]["status"] == "done",
+          f"wall {concl['wall_s']} -> {d2['conclusion']['wall_s']}")
+    check("迟到不重复入仓(调参交错)", len(d2["warehouse"]) == 2)
+
+    # 3. 源站慢(延迟>超时)：出现超时与迟到尝试，迟到不重复入仓
+    set_config(c, source_delay_ms=2600, source_slots=3, client_timeout_ms=900, max_attempts=3)
     ids = [f"T2-{i}" for i in range(3)]
     d = wait_batch(c, submit(c, ids), timeout=90)
     fetch = spans_of(d, stage="fetch", side="client")
@@ -84,7 +127,7 @@ def main():
     eff = [s for s in fetch if s["status"] == "effective"]
     check("每样品恰一个有效尝试", len(eff) == 3, f"{len(eff)}/3")
 
-    # 3. 等名额：名额=1、8 样品，源站服务端上报 queue_ms>0
+    # 4. 等名额：名额=1、8 样品，源站服务端上报 queue_ms>0
     set_config(c, source_delay_ms=300, source_slots=1, client_timeout_ms=5000)
     ids = [f"T3-{i}" for i in range(8)]
     d = wait_batch(c, submit(c, ids), timeout=90)
@@ -96,7 +139,7 @@ def main():
           str(d["conclusion"]["bottleneck"]))
     set_config(c, source_slots=3)
 
-    # 4. 调慢质控②：瓶颈迁移到质控②
+    # 5. 调慢质控②：瓶颈迁移到质控②
     set_config(c, source_delay_ms=150, qc_match_delay_ms=1500, client_timeout_ms=3000)
     ids = [f"T4-{i}" for i in range(4)]
     d = wait_batch(c, submit(c, ids), timeout=60)
@@ -104,7 +147,7 @@ def main():
           str(d["conclusion"]["bottleneck"]))
     set_config(c, qc_match_delay_ms=200)
 
-    # 5. 源站首次失败：批次完成，存在失败尝试且有效尝试为 #2
+    # 6. 源站首次失败：批次完成，存在失败尝试且有效尝试为 #2
     set_config(c, source_fail_first=True)
     ids = [f"T5-{i}" for i in range(3)]
     d = wait_batch(c, submit(c, ids), timeout=60)
@@ -115,7 +158,7 @@ def main():
     check("重试#2成为有效尝试", len(eff2) == 3, f"{len(eff2)}/3")
     set_config(c, source_fail_first=False)
 
-    # 6. 质控①首次失败：批次失败，阻断定位在质控①，不伪造成功链
+    # 7. 质控①首次失败：批次失败，阻断定位在质控①，不伪造成功链
     set_config(c, qc_nonneg_fail_first=True)
     ids = [f"T6-{i}" for i in range(3)]
     d = wait_batch(c, submit(c, ids), timeout=60)
@@ -127,14 +170,14 @@ def main():
     check("失败批次零入仓", len(d["warehouse"]) == 0)
     set_config(c, qc_nonneg_fail_first=False)
 
-    # 7. 演示钩子：NEG 负浓度 / MIX 错位样品号
+    # 8. 演示钩子：NEG 负浓度 / MIX 错位样品号
     d = wait_batch(c, submit(c, ["HOOK-NEG-1", "HOOK-MIX-1", "HOOK-OK-1"]), timeout=60)
     bl = {b["sample_id"]: b["stage"] for b in (d["conclusion"]["blocking"] or [])}
     check("NEG 阻断于质控①", bl.get("HOOK-NEG-1") == "qc_nonneg", str(bl))
     check("MIX 阻断于质控②", bl.get("HOOK-MIX-1") == "qc_match", str(bl))
     check("正常样品照常入仓", any(w["sample_id"] == "HOOK-OK-1" for w in d["warehouse"]))
 
-    # 8. 多批交错：两批并发，记录不串
+    # 9. 多批交错：两批并发，记录不串
     b1 = submit(c, [f"X1-{i}" for i in range(5)])
     b2 = submit(c, [f"X2-{i}" for i in range(5)])
     d1, d2 = wait_batch(c, b1, timeout=60), wait_batch(c, b2, timeout=60)

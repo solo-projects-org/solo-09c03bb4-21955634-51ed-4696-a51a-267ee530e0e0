@@ -173,7 +173,11 @@ async function refreshBatches(){
   </tr>`).join('');
   if(currentBatch!==null){
     const cur = rows.find(x=>x.id===currentBatch);
-    if(cur && cur.status==='running') loadDetail(currentBatch);
+    // 运行中持续刷新;定稿后若仍有在途跨度(旧尝试收尾中)也继续刷新,
+    // 以便迟到证据及时追加到时间线
+    const inflight = currentDetail && currentDetail.batch.id===currentBatch &&
+                     currentDetail.spans.some(s=>!s.end_ts);
+    if(cur && (cur.status==='running' || inflight)) loadDetail(currentBatch);
   }
 }
 
@@ -216,7 +220,7 @@ function renderChain(d){
   }).join('');
   document.getElementById('chainBox').innerHTML =
     `<b>决定完成时间的等待与执行链(样品 ${c.chain.sample_id},合计 ${c.chain.total_s}s;`+
-    `批次墙钟 ${c.wall_s}s):</b>
+    `完成耗时(批次开始→最后入仓) ${c.wall_s}s):</b>
      <table><thead><tr><th>类型</th><th>环节</th><th>耗时</th><th>说明</th></tr></thead>
      <tbody>${rows}</tbody></table>`;
 }
@@ -226,11 +230,11 @@ function renderStages(d){
   if(d.batch.status==='running' || !c || !c.per_stage){ document.getElementById('stageBox').innerHTML=''; return; }
   const rows = Object.entries(c.per_stage).map(([k,v])=>
     `<tr><td>${v.label}</td><td>${v.attempts}</td><td>${v.sum_s}</td><td>${v.wall_s}</td>
-     <td>${v.effective}</td><td>${v.failed}</td><td>${v.late}</td><td>${v.gave_up??0}</td></tr>`).join('');
+     <td>${v.effective}</td><td>${v.failed}</td><td>${v.late}</td><td>${v.in_flight??0}</td><td>${v.gave_up??0}</td></tr>`).join('');
   document.getElementById('stageBox').innerHTML =
-    `<b>分阶段统计(求和≠墙钟:并行质控、重叠重试、多样品并行均不直接相加):</b>
+    `<b>分阶段统计(求和≠墙钟:并行质控、重叠重试、多样品并行均不直接相加;在途=定稿时仍未结束的旧尝试):</b>
      <table><thead><tr><th>阶段</th><th>调用次数</th><th>耗时求和 s</th><th>墙钟跨度 s</th>
-     <th>有效</th><th>失败</th><th>迟到</th><th>曾超时放弃</th></tr></thead><tbody>${rows}</tbody></table>`;
+     <th>有效</th><th>失败</th><th>迟到</th><th>在途</th><th>曾超时放弃</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function renderWaterfall(d){

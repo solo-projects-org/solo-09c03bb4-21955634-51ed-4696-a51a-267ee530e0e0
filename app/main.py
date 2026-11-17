@@ -60,8 +60,13 @@ async def batch_detail(bid: int):
         return JSONResponse({"error": "not found"}, status_code=404)
     spans = db.query("SELECT * FROM spans WHERE batch_id=? ORDER BY start_ts,id", (bid,))
     wh = db.query("SELECT * FROM warehouse WHERE batch_id=? ORDER BY stored_at", (bid,))
-    # 结论按当前记录实时重算：迟到跨度随时可能补记，看到的一定与记录一致
-    concl = analysis.analyze(bid) if spans else None
+    # 已定稿批次：结论以定稿时存储的为准——与批次列表同一结论；
+    # 迟到证据只追加到时间线/调用明细(spans)，不改写结论。
+    # 运行中批次：按当前记录实时评估进度。
+    if b["status"] == "running":
+        concl = analysis.analyze(bid) if spans else None
+    else:
+        concl = json.loads(b["conclusion"]) if b["conclusion"] else None
     return {
         "batch": {"id": b["id"], "status": b["status"], "created_at": b["created_at"],
                   "finished_at": b["finished_at"], "sample_ids": json.loads(b["sample_ids"])},

@@ -19,13 +19,21 @@ HARD_TIMEOUT_S = 30.0
 
 _client = None
 
-# batch_id -> 仍在收尾的迟到尝试任务；批次定稿前要等它们结束，结论才完整
+# batch_id -> 仍在收尾的迟到尝试任务。仅作强引用防止任务被事件循环回收；
+# 批次定稿不再等待它们——旧尝试收尾后只在时间线追加迟到证据。
 _finalizers = {}
 
 
 def _track_finalizer(batch_id, task):
-    _finalizers.setdefault(batch_id, set()).add(task)
-    task.add_done_callback(lambda t: _finalizers.get(batch_id, set()).discard(t))
+    tasks = _finalizers.setdefault(batch_id, set())
+    tasks.add(task)
+
+    def _done(t):
+        tasks.discard(t)
+        if not tasks:
+            _finalizers.pop(batch_id, None)
+
+    task.add_done_callback(_done)
 
 
 def http():
@@ -184,12 +192,11 @@ async def run_batch(batch_id, sample_ids):
                              return_exceptions=True)
     except Exception:
         pass
-    # 等在途的迟到尝试收尾(有 httpx 硬超时兜底)，使定稿结论如实包含迟到记录
-    pending = list(_finalizers.get(batch_id, ()))
-    if pending:
-        await asyncio.wait(pending)
-    _finalizers.pop(batch_id, None)
+    # 定稿：所有样品均有有效取数+两项质控通过+入仓记录(或已明确失败)即确认结论。
+    # 仍在途的旧取数尝试由后台任务收尾，只在时间线追加迟到证据，
+    # 不推迟、不改写本结论；完成耗时按批次开始至最后入仓计算。
     concl = analysis.analyze(batch_id)
     status = "done" if concl.get("status") == "done" else "failed"
+    finished_at = concl["t1"] if status == "done" else time.time()
     db.execute("UPDATE batches SET status=?, finished_at=?, conclusion=? WHERE id=?",
-               (status, time.time(), json.dumps(concl, ensure_ascii=False), batch_id))
+               (status, finished_at, json.dumps(concl, ensure_ascii=False), batch_id))
